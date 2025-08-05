@@ -1,0 +1,8 @@
+streamlit
+dotenv
+sklearn
+groq
+langchain
+langchain-community
+qdrant-client
+sentence-transformers

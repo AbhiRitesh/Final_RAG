@@ -1,3 +1,5 @@
+# rag_core.py
+
 from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient, models
@@ -5,21 +7,20 @@ from sentence_transformers import SentenceTransformer
 from groq import Groq
 import os
 
-from dotenv import load_dotenv # Import load_dotenv
+from dotenv import load_dotenv
 
 # Load environment variables from .env file
-load_dotenv() # Call load_dotenv() at the very beginning
+load_dotenv()
 
 # --- Configuration ---
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost") # Default to localhost if not set
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") # Only if using Qdrant Cloud
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLLECTION_NAME = "startup_proposals"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # --- 1. Data Loading and Chunking ---
-def load_and_chunk_documents(directory="data"): # Changed default directory to 'data'
+def load_and_chunk_documents(directory="data"):
     documents = []
-    # Ensure the directory exists
     if not os.path.exists(directory):
         print(f"Directory '{directory}' does not exist. Please create it and place your PDFs inside.")
         return []
@@ -31,9 +32,8 @@ def load_and_chunk_documents(directory="data"): # Changed default directory to '
             docs = loader.load()
             documents.extend(docs)
 
-    print(f"Loaded {len(documents)} pages in total.") #cite: 2222, 2364, 3206
+    print(f"Loaded {len(documents)} pages in total.")
 
-    # Paragraph chunking
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
         chunk_overlap=50,
@@ -68,8 +68,6 @@ def initialize_qdrant_client():
 def index_documents_to_qdrant(chunks, embeddings_model):
     client = initialize_qdrant_client()
 
-    # Create collection if it doesn't exist
-    # Consider using client.get_collection() to check existence and skip recreation if not needed for production
     try:
         client.recreate_collection(
             collection_name=COLLECTION_NAME,
@@ -79,14 +77,10 @@ def index_documents_to_qdrant(chunks, embeddings_model):
         print(f"Collection '{COLLECTION_NAME}' recreated/ensured.")
     except Exception as e:
         print(f"Could not recreate collection, assuming it exists or handling error: {e}")
-        # If collection already exists and you don't want to recreate, you might want to clear existing points
-        # or handle a different upsert strategy. For this demo, recreate is fine.
 
-    # Prepare points for upsertion
     points = []
     for i, chunk in enumerate(chunks):
         embedding = embeddings_model.embed_query(chunk.page_content)
-        # Store source and optionally page number if available in metadata
         source_info = chunk.metadata.get('source', 'unknown')
         page_info = chunk.metadata.get('page', 'N/A')
         points.append(
@@ -97,7 +91,6 @@ def index_documents_to_qdrant(chunks, embeddings_model):
             )
         )
 
-    # Upsert points in batches
     batch_size = 100
     for i in range(0, len(points), batch_size):
         batch = points[i:i + batch_size]
@@ -159,3 +152,64 @@ class RAGPipeline:
             max_tokens=500
         )
         return chat_completion.choices[0].message.content
+
+    def evaluate_with_judge(self, query, answer, context):
+        """
+        Uses an LLM as a judge to evaluate a generated answer.
+        The judge will assess the answer's correctness and faithfulness to the context.
+        """
+        judge_system_prompt = {
+            "role": "system",
+            "content": (
+                "You are an expert evaluator. Your task is to act as an impartial judge to evaluate a generated answer "
+                "based on a given question and a provided context. "
+                "You must perform two checks: "
+                "1. **Faithfulness**: Does the answer contain information that is directly supported by the context? "
+                "2. **Correctness**: Does the answer directly and accurately address the user's question, using only the provided context? "
+                "Provide a final verdict (e.g., 'Correct', 'Incorrect', 'Partially Correct') and a brief reasoning for your decision. "
+                "The format should be: 'Verdict: [Your Verdict]\nReasoning: [Your Reasoning]'"
+            )
+        }
+
+        judge_user_prompt = {
+            "role": "user",
+            "content": f"""
+Question: {query}
+
+Context:
+{context}
+
+Generated Answer:
+{answer}
+
+---
+Evaluate the generated answer based on the criteria above.
+"""
+        }
+
+        messages = [judge_system_prompt, judge_user_prompt]
+        
+        chat_completion = self.groq_client.chat.completions.create(
+            messages=messages,
+            model="llama3-8b-8192", # Using the same model for the judge
+            temperature=0.0, # Use a low temperature for deterministic evaluation
+            max_tokens=250
+        )
+
+        response_text = chat_completion.choices[0].message.content
+        
+        # Parse the verdict and reasoning from the LLM's response
+        verdict = "Could not parse verdict."
+        reasoning = "Could not parse reasoning."
+
+        if "Verdict:" in response_text and "Reasoning:" in response_text:
+            lines = response_text.split('\n')
+            for line in lines:
+                if line.startswith("Verdict:"):
+                    verdict = line.replace("Verdict:", "").strip()
+                elif line.startswith("Reasoning:"):
+                    reasoning = line.replace("Reasoning:", "").strip()
+        else:
+            reasoning = response_text # If parsing fails, use the entire response as reasoning
+        
+        return verdict, reasoning

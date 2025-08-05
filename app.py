@@ -1,11 +1,9 @@
-# app.py
-
 import streamlit as st
 import os
 from dotenv import load_dotenv
-from sklearn.metrics import f1_score
-import re
 from groq import Groq
+from bert_score import score
+import re
 
 # Load environment variables from .env file
 load_dotenv()
@@ -45,15 +43,12 @@ if 'current_generated_answer' not in st.session_state:
     st.session_state.current_generated_answer = ""
 if 'current_expected_answer' not in st.session_state:
     st.session_state.current_expected_answer = ""
-if 'current_f1_score' not in st.session_state:
-    st.session_state.current_f1_score = None
-
-
-# --- Helper for F1-score tokenization ---
-def tokenize_for_f1(text):
-    # Convert to lowercase and split by non-alphanumeric characters, then filter empty strings
-    return [word for word in re.split(r'\W+', text.lower()) if word]
-
+if 'current_bert_f1' not in st.session_state:
+    st.session_state.current_bert_f1 = None
+if 'llm_judge_score' not in st.session_state:
+    st.session_state.llm_judge_score = None
+if 'llm_judge_reasoning' not in st.session_state:
+    st.session_state.llm_judge_reasoning = ""
 
 # --- Sidebar for Settings and Initialization ---
 with st.sidebar:
@@ -102,25 +97,23 @@ with st.sidebar:
                 st.error(f"Error during RAG system initialization: {e}")
                 st.session_state.rag_initialized = False
 
-
     st.subheader("Few-Shot Examples (for LLM Guidance)")
     st.write("These examples help guide the LLM's response style.")
     for i, (q, a) in enumerate(st.session_state.few_shot_examples):
-        st.text_area(f"Example {i+1} Question:", value=q, key=f"fs_q_{i}_sidebar") # Unique keys
-        st.text_area(f"Example {i+1} Answer:", value=a, key=f"fs_a_{i}_sidebar") # Unique keys
-        if st.button(f"Remove Example {i+1}", key=f"remove_fs_{i}_sidebar"): # Unique keys
+        st.text_area(f"Example {i+1} Question:", value=q, key=f"fs_q_{i}_sidebar")
+        st.text_area(f"Example {i+1} Answer:", value=a, key=f"fs_a_{i}_sidebar")
+        if st.button(f"Remove Example {i+1}", key=f"remove_fs_{i}_sidebar"):
             st.session_state.few_shot_examples.pop(i)
             st.experimental_rerun()
     
-    new_q = st.text_input("New Few-Shot Question:", key="new_fs_q_sidebar") # Unique keys
-    new_a = st.text_input("New Few-Shot Answer:", key="new_fs_a_sidebar") # Unique keys
-    if st.button("Add Few-Shot Example", key="add_fs_button_sidebar"): # Unique key
+    new_q = st.text_input("New Few-Shot Question:", key="new_fs_q_sidebar")
+    new_a = st.text_input("New Few-Shot Answer:", key="new_fs_a_sidebar")
+    if st.button("Add Few-Shot Example", key="add_fs_button_sidebar"):
         if new_q and new_a:
             st.session_state.few_shot_examples.append((new_q, new_a))
             st.experimental_rerun()
         else:
             st.warning("Please enter both question and answer for a new example.")
-
 
 # --- Main Application Logic ---
 if not st.session_state.rag_initialized:
@@ -129,7 +122,6 @@ else:
     st.subheader("Ask a Question")
     user_query = st.text_area("Your Question:", height=100, key="user_query_input")
     
-    # Use a flag in session_state to control when to display the answer and evaluation
     if st.button("Get Answer", key="get_answer_button"):
         if user_query:
             with st.spinner("Searching for context and generating answer..."):
@@ -141,24 +133,20 @@ else:
 
                     response = st.session_state.rag_pipeline.generate_response(user_query, context, st.session_state.few_shot_examples)
 
-                    # Store the generated answer and reset expected/F1 for new query
                     st.session_state.current_generated_answer = response
                     st.session_state.current_sources = source_display
                     st.session_state.current_context_display = context_display
-                    st.session_state.current_expected_answer = "" # Clear previous expected answer
-                    st.session_state.current_f1_score = None # Clear previous F1 score
+                    st.session_state.current_expected_answer = ""
+                    st.session_state.current_bert_f1 = None
+                    st.session_state.llm_judge_score = None
+                    st.session_state.llm_judge_reasoning = ""
 
                 except Exception as e:
                     st.error(f"Error getting answer: {e}")
                     st.session_state.current_generated_answer = ""
-                    st.session_state.current_sources = ""
-                    st.session_state.current_context_display = ""
-                    st.session_state.current_expected_answer = ""
-                    st.session_state.current_f1_score = None
         else:
             st.warning("Please enter a question to get an answer.")
 
-    # Always display the last generated answer and evaluation section if an answer exists
     if st.session_state.current_generated_answer:
         st.success("Answer Generated!")
         st.write("### Answer:")
@@ -169,40 +157,91 @@ else:
             st.text_area("Context:", value=st.session_state.current_context_display, height=300, disabled=True)
 
         # --- Evaluation Section ---
-        st.write("### Evaluate Answer (Manual F1-Score)")
-        # Store the expected_answer input in session_state as it's typed
+        st.write("### Evaluate Answer")
+
+        st.write("#### 1. BERTScore F1 (Semantic Evaluation)")
         st.session_state.current_expected_answer = st.text_area(
-            "Enter Expected Answer for F1 Calculation:",
-            value=st.session_state.current_expected_answer, # Load from session_state
-            key="eval_expected_answer_input" # Unique key for this widget
+            "Enter an Expected (Reference) Answer for BERTScore:",
+            value=st.session_state.current_expected_answer,
+            key="eval_expected_answer_input"
         )
         
-        # Calculate F1-Score button
-        if st.button("Calculate F1-Score", key="calculate_f1_button"):
+        if st.button("Calculate BERTScore F1", key="calculate_bert_f1_button"):
             if st.session_state.current_expected_answer:
-                predicted_tokens = tokenize_for_f1(st.session_state.current_generated_answer)
-                expected_tokens = tokenize_for_f1(st.session_state.current_expected_answer)
-
-                common_tokens = set(predicted_tokens) & set(expected_tokens)
-                
-                precision = len(common_tokens) / len(predicted_tokens) if predicted_tokens else 0
-                recall = len(common_tokens) / len(expected_tokens) if expected_tokens else 0
-
-                if (precision + recall) == 0:
-                    f1 = 0.0
-                else:
-                    f1 = 2 * (precision * recall) / (precision + recall)
-                
-                st.session_state.current_f1_score = f1 # Store F1 in session state
+                try:
+                    # Use bert-score to get F1 score
+                    P, R, F1 = score([st.session_state.current_generated_answer], 
+                                     [st.session_state.current_expected_answer], 
+                                     lang="en", verbose=True)
+                    st.session_state.current_bert_f1 = F1.item() # Get the single F1 score from the tensor
+                except Exception as e:
+                    st.error(f"BERTScore calculation error: {e}")
             else:
-                st.warning("Please provide an expected answer to calculate F1-Score.")
-                st.session_state.current_f1_score = None # Clear F1 if no expected answer
+                st.warning("Please provide an expected answer to calculate BERTScore F1.")
 
-        # Display F1-score if it has been calculated
-        if st.session_state.current_f1_score is not None:
-            st.metric(label="F1-Score", value=f"{st.session_state.current_f1_score:.4f}")
+        if st.session_state.current_bert_f1 is not None:
+            st.metric(label="BERTScore F1", value=f"{st.session_state.current_bert_f1:.4f}")
             st.info(
-                "The F1-score is the harmonic mean of precision and recall. "
-                "A higher score indicates a better balance between correctly identifying relevant information (precision) "
-                "and retrieving all relevant information (recall) in the generated answer compared to the expected answer."
+                "BERTScore is a more advanced F1-score that measures semantic similarity "
+                "using contextual word embeddings from a BERT model, rather than just "
+                "word overlap. A higher score indicates better semantic alignment."
+            )
+
+        st.markdown("---")
+
+        st.write("#### 2. LLM as a Judge (Quality Evaluation)")
+        llm_judge_prompt = (
+            "You are an expert evaluator. Your task is to rate the quality of a generated answer "
+            "based on a given question and a reference answer. The quality should be judged on a "
+            "scale of 1 to 5, where 1 is a very poor answer and 5 is an excellent answer. "
+            "Provide a short reasoning for your score.\n\n"
+            "Question: {question}\n\n"
+            "Generated Answer: {generated_answer}\n\n"
+            "Reference Answer: {expected_answer}\n\n"
+            "Please provide your response in the format: "
+            "Score: [1-5]\n"
+            "Reasoning: [Your detailed reasoning]\n"
+        )
+
+        if st.button("Run LLM Judge", key="run_llm_judge_button"):
+            if user_query and st.session_state.current_generated_answer:
+                with st.spinner("Asking the LLM to judge the answer..."):
+                    try:
+                        judge_messages = [
+                            {"role": "system", "content": "You are a helpful and fair AI judge."},
+                            {"role": "user", "content": llm_judge_prompt.format(
+                                question=user_query,
+                                generated_answer=st.session_state.current_generated_answer,
+                                expected_answer=st.session_state.current_expected_answer or "N/A"
+                            )}
+                        ]
+                        
+                        judge_response = st.session_state.groq_client.chat.completions.create(
+                            messages=judge_messages,
+                            model="llama3-8b-8192",
+                            temperature=0.1,
+                            max_tokens=256
+                        ).choices[0].message.content
+
+                        score_match = re.search(r"Score: (\d)", judge_response)
+                        if score_match:
+                            st.session_state.llm_judge_score = int(score_match.group(1))
+                            st.session_state.llm_judge_reasoning = judge_response.replace(score_match.group(0), "").strip()
+                        else:
+                            st.session_state.llm_judge_score = "N/A"
+                            st.session_state.llm_judge_reasoning = judge_response
+
+                    except Exception as e:
+                        st.error(f"Error running LLM judge: {e}")
+            else:
+                st.warning("Please get a generated answer first before running the judge.")
+
+        if st.session_state.llm_judge_score is not None:
+            st.metric(label="LLM Judge Score", value=st.session_state.llm_judge_score)
+            st.write("Reasoning:")
+            st.write(st.session_state.llm_judge_reasoning)
+            st.info(
+                "An LLM-as-a-Judge provides a human-like, qualitative evaluation of an answer. "
+                "It goes beyond a simple score by providing reasoning, which can be useful for "
+                "understanding the nuances of why an answer is considered good or bad."
             )
