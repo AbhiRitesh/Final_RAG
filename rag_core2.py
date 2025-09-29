@@ -1,16 +1,15 @@
-# rag_core.py
-
 from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 from groq import Groq
 import os
+import json
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv # Import load_dotenv
 
 # Load environment variables from .env file
-load_dotenv()
+load_dotenv() # Call load_dotenv() at the very beginning
 
 # --- Configuration ---
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
@@ -67,12 +66,11 @@ def initialize_qdrant_client():
 
 def index_documents_to_qdrant(chunks, embeddings_model):
     client = initialize_qdrant_client()
-
     try:
         client.recreate_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=models.VectorParams(size=embeddings_model.model.get_sentence_embedding_dimension(),
-                                               distance=models.Distance.COSINE)
+                                                distance=models.Distance.COSINE)
         )
         print(f"Collection '{COLLECTION_NAME}' recreated/ensured.")
     except Exception as e:
@@ -118,7 +116,7 @@ class RAGPipeline:
         )
         context = [hit.payload["text"] for hit in search_result]
         sources = [hit.payload["source"] for hit in search_result]
-        return "\n\n".join(context), sources
+        return context, sources
 
     def generate_response(self, query, context, few_shot_examples=None):
         system_message = {
@@ -147,69 +145,62 @@ class RAGPipeline:
 
         chat_completion = self.groq_client.chat.completions.create(
             messages=messages,
-            model="llama-3.1-8b-instant",
+            model="llama3-8b-8192",
             temperature=0.7,
             max_tokens=500
         )
         return chat_completion.choices[0].message.content
 
-    def evaluate_with_judge(self, query, answer, context):
+    def llm_judge_evaluate(self, query, context, generated_answer):
         """
-        Uses an LLM as a judge to evaluate a generated answer.
-        The judge will assess the answer's correctness and faithfulness to the context.
+        Evaluates a generated answer using an LLM-as-a-judge approach.
+        The judge rates the answer on faithfulness and helpfulness.
         """
-        judge_system_prompt = {
+        judge_system_message = {
             "role": "system",
             "content": (
-                "You are an expert evaluator. Your task is to act as an impartial judge to evaluate a generated answer "
-                "based on a given question and a provided context. "
-                "You must perform two checks: "
-                "1. **Faithfulness**: Does the answer contain information that is directly supported by the context? "
-                "2. **Correctness**: Does the answer directly and accurately address the user's question, using only the provided context? "
-                "Provide a final verdict (e.g., 'Correct', 'Incorrect', 'Partially Correct') and a brief reasoning for your decision. "
-                "The format should be: 'Verdict: [Your Verdict]\nReasoning: [Your Reasoning]'"
+                "You are an impartial judge. Your task is to evaluate a generated answer based on a given question and context. "
+                "Rate the answer on two criteria: **faithfulness** and **helpfulness**. "
+                "Faithfulness: Does the answer rely *only* on the provided context? Score 1-5, where 5 is perfectly grounded. "
+                "Helpfulness: Does the answer directly and effectively address the user's question? Score 1-5, where 5 is a perfect answer. "
+                "Provide your response as a JSON object with a 'faithfulness' integer score, a 'helpfulness' integer score, and a 'summary' string explanation. "
+                "Example response: {'faithfulness': 4, 'helpfulness': 5, 'summary': 'The answer is mostly grounded and very helpful.'}"
             )
         }
 
-        judge_user_prompt = {
+        judge_user_message = {
             "role": "user",
-            "content": f"""
-Question: {query}
-
-Context:
-{context}
-
-Generated Answer:
-{answer}
-
----
-Evaluate the generated answer based on the criteria above.
-"""
+            "content": (
+                f"Question: {query}\n\n"
+                f"Context: {context}\n\n"
+                f"Generated Answer: {generated_answer}\n\n"
+            )
         }
-
-        messages = [judge_system_prompt, judge_user_prompt]
         
+        messages = [judge_system_message, judge_user_message]
+
+        # Use a more powerful model for the judge if available, or just a separate call
         chat_completion = self.groq_client.chat.completions.create(
             messages=messages,
-            model="llama-3.1-8b-instant", # Using the same model for the judge
-            temperature=0.0, # Use a low temperature for deterministic evaluation
-            max_tokens=250
+            model="llama3-70b-8192", # Using a larger, more capable model as the judge
+            temperature=0.1, # Keep the temperature low for consistent, deterministic scoring
+            max_tokens=200,
+            response_format={"type": "json_object"}
         )
-
-        response_text = chat_completion.choices[0].message.content
         
-        # Parse the verdict and reasoning from the LLM's response
-        verdict = "Could not parse verdict."
-        reasoning = "Could not parse reasoning."
+        raw_response = chat_completion.choices[0].message.content
+        try:
+            parsed_response = json.loads(raw_response)
+            faithfulness_score = parsed_response.get('faithfulness')
+            helpfulness_score = parsed_response.get('helpfulness')
+            summary = parsed_response.get('summary')
+            
+            if not all([isinstance(faithfulness_score, int), isinstance(helpfulness_score, int), isinstance(summary, str)]):
+                 raise ValueError("LLM judge did not return the expected JSON format.")
 
-        if "Verdict:" in response_text and "Reasoning:" in response_text:
-            lines = response_text.split('\n')
-            for line in lines:
-                if line.startswith("Verdict:"):
-                    verdict = line.replace("Verdict:", "").strip()
-                elif line.startswith("Reasoning:"):
-                    reasoning = line.replace("Reasoning:", "").strip()
-        else:
-            reasoning = response_text # If parsing fails, use the entire response as reasoning
-        
-        return verdict, reasoning
+            scores = {'faithfulness': faithfulness_score, 'helpfulness': helpfulness_score}
+            return scores, summary
+
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"LLM judge output was not valid JSON: {raw_response}")
+            return {'faithfulness': 1, 'helpfulness': 1}, f"Error parsing judge's response: {e}. Raw output: {raw_response}"

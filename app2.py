@@ -1,15 +1,17 @@
+# app.py
+
 import streamlit as st
 import os
 from dotenv import load_dotenv
-from groq import Groq
-from bert_score import score
+from sklearn.metrics import f1_score
 import re
+from groq import Groq
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Import core RAG functionalities
-from rag_core import (
+from rag_core2 import (
     load_and_chunk_documents,
     BGEEmbeddings,
     initialize_qdrant_client,
@@ -20,7 +22,7 @@ from rag_core import (
 
 # --- Streamlit UI Configuration ---
 st.set_page_config(page_title="Startup Business Proposal RAG", layout="wide")
-st.title("Startup Business Proposal Q&A with RAG")
+st.title("Startup Business Proposal Q&A 🚀")
 
 # --- Environment Variable Check ---
 if not os.getenv("GROQ_API_KEY"):
@@ -43,12 +45,23 @@ if 'current_generated_answer' not in st.session_state:
     st.session_state.current_generated_answer = ""
 if 'current_expected_answer' not in st.session_state:
     st.session_state.current_expected_answer = ""
-if 'current_bert_f1' not in st.session_state:
-    st.session_state.current_bert_f1 = None
-if 'llm_judge_score' not in st.session_state:
-    st.session_state.llm_judge_score = None
-if 'llm_judge_reasoning' not in st.session_state:
-    st.session_state.llm_judge_reasoning = ""
+if 'current_f1_score' not in st.session_state:
+    st.session_state.current_f1_score = None
+if 'llm_judge_result' not in st.session_state:
+    st.session_state.llm_judge_result = None
+if 'llm_judge_explanation' not in st.session_state:
+    st.session_state.llm_judge_explanation = None
+if 'current_context' not in st.session_state:
+    st.session_state.current_context = ""
+if 'current_query' not in st.session_state:
+    st.session_state.current_query = ""
+
+
+# --- Helper for F1-score tokenization ---
+def tokenize_for_f1(text):
+    # Convert to lowercase and split by non-alphanumeric characters, then filter empty strings
+    return [word for word in re.split(r'\W+', text.lower()) if word]
+
 
 # --- Sidebar for Settings and Initialization ---
 with st.sidebar:
@@ -115,6 +128,7 @@ with st.sidebar:
         else:
             st.warning("Please enter both question and answer for a new example.")
 
+
 # --- Main Application Logic ---
 if not st.session_state.rag_initialized:
     st.info("Please initialize the RAG system from the sidebar.")
@@ -136,14 +150,22 @@ else:
                     st.session_state.current_generated_answer = response
                     st.session_state.current_sources = source_display
                     st.session_state.current_context_display = context_display
+                    st.session_state.current_context = context
+                    st.session_state.current_query = user_query
                     st.session_state.current_expected_answer = ""
-                    st.session_state.current_bert_f1 = None
-                    st.session_state.llm_judge_score = None
-                    st.session_state.llm_judge_reasoning = ""
+                    st.session_state.current_f1_score = None
+                    st.session_state.llm_judge_result = None
+                    st.session_state.llm_judge_explanation = None
 
                 except Exception as e:
                     st.error(f"Error getting answer: {e}")
                     st.session_state.current_generated_answer = ""
+                    st.session_state.current_sources = ""
+                    st.session_state.current_context_display = ""
+                    st.session_state.current_expected_answer = ""
+                    st.session_state.current_f1_score = None
+                    st.session_state.llm_judge_result = None
+                    st.session_state.llm_judge_explanation = None
         else:
             st.warning("Please enter a question to get an answer.")
 
@@ -156,92 +178,71 @@ else:
         with st.expander("See Retrieved Context"):
             st.text_area("Context:", value=st.session_state.current_context_display, height=300, disabled=True)
 
-        # --- Evaluation Section ---
-        st.write("### Evaluate Answer")
-
-        st.write("#### 1. BERTScore F1 (Semantic Evaluation)")
-        st.session_state.current_expected_answer = st.text_area(
-            "Enter an Expected (Reference) Answer for BERTScore:",
-            value=st.session_state.current_expected_answer,
-            key="eval_expected_answer_input"
-        )
+        st.write("---")
+        st.write("### Evaluation")
         
-        if st.button("Calculate BERTScore F1", key="calculate_bert_f1_button"):
-            if st.session_state.current_expected_answer:
-                try:
-                    # Use bert-score to get F1 score
-                    P, R, F1 = score([st.session_state.current_generated_answer], 
-                                     [st.session_state.current_expected_answer], 
-                                     lang="en", verbose=True)
-                    st.session_state.current_bert_f1 = F1.item() # Get the single F1 score from the tensor
-                except Exception as e:
-                    st.error(f"BERTScore calculation error: {e}")
-            else:
-                st.warning("Please provide an expected answer to calculate BERTScore F1.")
+        col1, col2 = st.columns(2)
 
-        if st.session_state.current_bert_f1 is not None:
-            st.metric(label="BERTScore F1", value=f"{st.session_state.current_bert_f1:.4f}")
-            st.info(
-                "BERTScore is a more advanced F1-score that measures semantic similarity "
-                "using contextual word embeddings from a BERT model, rather than just "
-                "word overlap. A higher score indicates better semantic alignment."
+        with col1:
+            # --- Manual F1-Score Evaluation ---
+            st.subheader("F1-Score (Using Bert-score)")
+            st.session_state.current_expected_answer = st.text_area(
+                "Enter Expected Answer:",
+                value=st.session_state.current_expected_answer,
+                key="eval_expected_answer_input"
             )
+            
+            if st.button("Calculate F1-Score", key="calculate_f1_button"):
+                if st.session_state.current_expected_answer:
+                    predicted_tokens = tokenize_for_f1(st.session_state.current_generated_answer)
+                    expected_tokens = tokenize_for_f1(st.session_state.current_expected_answer)
+                    
+                    common_tokens = set(predicted_tokens) & set(expected_tokens)
+                    
+                    precision = len(common_tokens) / len(predicted_tokens) if predicted_tokens else 0
+                    recall = len(common_tokens) / len(expected_tokens) if expected_tokens else 0
 
-        st.markdown("---")
+                    if (precision + recall) == 0:
+                        f1 = 0.0
+                    else:
+                        f1 = 2 * (precision * recall) / (precision + recall)
+                    
+                    st.session_state.current_f1_score = f1
+                else:
+                    st.warning("Please provide an expected answer to calculate F1-Score.")
+                    st.session_state.current_f1_score = None
 
-        st.write("#### 2. LLM as a Judge (Quality Evaluation)")
-        llm_judge_prompt = (
-            "You are an expert evaluator. Your task is to rate the quality of a generated answer "
-            "based on a given question and a reference answer. The quality should be judged on a "
-            "scale of 1 to 5, where 1 is a very poor answer and 5 is an excellent answer. "
-            "Provide a short reasoning for your score.\n\n"
-            "Question: {question}\n\n"
-            "Generated Answer: {generated_answer}\n\n"
-            "Reference Answer: {expected_answer}\n\n"
-            "Please provide your response in the format: "
-            "Score: [1-5]\n"
-            "Reasoning: [Your detailed reasoning]\n"
-        )
+            if st.session_state.current_f1_score is not None:
+                st.metric(label="F1-Score", value=f"{st.session_state.current_f1_score:.4f}")
+                st.info(
+                    "F1-score measures the overlap between the generated and expected answers' tokens."
+                )
 
-        if st.button("Run LLM Judge", key="run_llm_judge_button"):
-            if user_query and st.session_state.current_generated_answer:
-                with st.spinner("Asking the LLM to judge the answer..."):
-                    try:
-                        judge_messages = [
-                            {"role": "system", "content": "You are a helpful and fair AI judge."},
-                            {"role": "user", "content": llm_judge_prompt.format(
-                                question=user_query,
-                                generated_answer=st.session_state.current_generated_answer,
-                                expected_answer=st.session_state.current_expected_answer or "N/A"
-                            )}
-                        ]
-                        
-                        judge_response = st.session_state.groq_client.chat.completions.create(
-                            messages=judge_messages,
-                            model="llama-3.1-8b-instant",
-                            temperature=0.1,
-                            max_tokens=256
-                        ).choices[0].message.content
+        with col2:
+            # --- LLM-as-a-Judge Evaluation ---
+            st.subheader("LLM-as-a-Judge")
+            if st.button("Evaluate with LLM Judge", key="llm_judge_button"):
+                if st.session_state.current_generated_answer:
+                    with st.spinner("LLM judge is evaluating the answer..."):
+                        try:
+                            judge_result, judge_explanation = st.session_state.rag_pipeline.llm_judge_evaluate(
+                                query=st.session_state.current_query,
+                                context=st.session_state.current_context_display,
+                                generated_answer=st.session_state.current_generated_answer
+                            )
+                            st.session_state.llm_judge_result = judge_result
+                            st.session_state.llm_judge_explanation = judge_explanation
+                        except Exception as e:
+                            st.error(f"Error during LLM judge evaluation: {e}")
+                            st.session_state.llm_judge_result = None
+                            st.session_state.llm_judge_explanation = None
+                else:
+                    st.warning("Please generate an answer first.")
 
-                        score_match = re.search(r"Score: (\d)", judge_response)
-                        if score_match:
-                            st.session_state.llm_judge_score = int(score_match.group(1))
-                            st.session_state.llm_judge_reasoning = judge_response.replace(score_match.group(0), "").strip()
-                        else:
-                            st.session_state.llm_judge_score = "N/A"
-                            st.session_state.llm_judge_reasoning = judge_response
-
-                    except Exception as e:
-                        st.error(f"Error running LLM judge: {e}")
-            else:
-                st.warning("Please get a generated answer first before running the judge.")
-
-        if st.session_state.llm_judge_score is not None:
-            st.metric(label="LLM Judge Score", value=st.session_state.llm_judge_score)
-            st.write("Reasoning:")
-            st.write(st.session_state.llm_judge_reasoning)
-            st.info(
-                "An LLM-as-a-Judge provides a human-like, qualitative evaluation of an answer. "
-                "It goes beyond a simple score by providing reasoning, which can be useful for "
-                "understanding the nuances of why an answer is considered good or bad."
-            )
+            if st.session_state.llm_judge_result:
+                st.metric(label="Judge's Faithfulness Score", value=f"{st.session_state.llm_judge_result['faithfulness']}/5")
+                st.metric(label="Judge's Helpfulness Score", value=f"{st.session_state.llm_judge_result['helpfulness']}/5")
+                st.text_area("Judge's Explanation:", value=st.session_state.llm_judge_explanation, height=150, disabled=True)
+                st.info(
+                    "The judge rates the answer on faithfulness (is it grounded in the context?) and helpfulness (does it effectively answer the question?)."
+                )
